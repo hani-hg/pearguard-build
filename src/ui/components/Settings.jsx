@@ -1,0 +1,846 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { useTheme } from '../theme.js';
+import Icon from '../icons.js';
+import Button from './primitives/Button.jsx';
+import Toggle from './primitives/Toggle.jsx';
+import Avatar from './Avatar.jsx';
+import AvatarPicker from './AvatarPicker.jsx';
+import { pickPhoto } from './avatarUtils.js';
+import { validatePin, MAX_PIN_LENGTH } from '../../pin-rules.js';
+import DeviceBackupModal from './DeviceBackupModal.jsx';
+import Collapsible from './primitives/Collapsible.jsx';
+
+const DEFAULT_TIME_OPTIONS = [15, 30, 60, 120];
+const DEFAULT_WARNING_THRESHOLDS = [10, 5, 1];
+const AVAILABLE_TIME_OPTIONS = [5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240];
+const AVAILABLE_WARNING_OPTIONS = [1, 2, 3, 5, 10, 15, 20, 30];
+
+// Long enough to collect a burst of chip taps into one sync, short enough that the
+// "Saved." confirmation still feels like a response to what you just did.
+const SAVE_DEBOUNCE_MS = 600;
+
+function formatMinutes(min) {
+  if (min < 60) return min + ' min';
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  if (m === 0) return h + (h === 1 ? ' hour' : ' hours');
+  return h + 'h ' + m + 'm';
+}
+
+const CATEGORY_LABELS = {
+  data: 'Block data',
+  tree: 'Tree index',
+  bitfield: 'Bitfield',
+  header: 'Header / oplog',
+  other: 'Other',
+};
+
+function Bar({ pct, color, bg }) {
+  return (
+    <div style={{ height: 6, borderRadius: 3, background: bg, overflow: 'hidden', marginTop: 4 }}>
+      <div style={{ height: '100%', width: `${Math.max(1, pct)}%`, background: color }} />
+    </div>
+  );
+}
+
+function StorageModal({ modal, onClose, breakdown, analyze, result, colors, typography, spacing, radius, formatBytes }) {
+  if (!modal) return null;
+
+  const title = modal === 'breakdown' ? 'Storage Breakdown'
+    : modal === 'analyze' ? 'Reclaimable Analysis'
+    : 'Reclaim Complete';
+
+  return (
+    <div onClick={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: `${spacing.lg}px` }}>
+      <div onClick={(e) => e.stopPropagation()} style={{ backgroundColor: colors.surface.card, borderRadius: `${radius.lg}px`, padding: `${spacing.lg}px`, maxWidth: 480, width: '100%', maxHeight: '80vh', overflowY: 'auto', border: `1px solid ${colors.border}` }}>
+        <h3 style={{ ...typography.subheading, color: colors.text.primary, margin: 0, marginBottom: `${spacing.md}px`, textAlign: 'center' }}>{title}</h3>
+
+        {modal === 'breakdown' && breakdown && (
+          <div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: `${spacing.md}px` }}>
+              <span style={{ fontSize: 13, color: colors.text.secondary }}>On disk</span>
+              <span style={{ fontSize: 15, fontWeight: 600, color: colors.text.primary }}>{formatBytes(breakdown.total)}</span>
+            </div>
+            {Object.entries(breakdown.cats).filter(([, v]) => v.count > 0).sort((a, b) => b[1].size - a[1].size).map(([cat, v]) => {
+              const pct = breakdown.total > 0 ? (100 * v.size / breakdown.total) : 0;
+              return (
+                <div key={cat} style={{ marginBottom: `${spacing.sm}px` }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13, color: colors.text.secondary }}>
+                    <span>{CATEGORY_LABELS[cat] || cat} <span style={{ color: colors.text.muted }}>({v.count})</span></span>
+                    <span>{formatBytes(v.size)} ({pct.toFixed(0)}%)</span>
+                  </div>
+                  <Bar pct={pct} color={colors.primary} bg={colors.border} />
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {modal === 'analyze' && analyze && (
+          <div>
+            <div style={{ padding: `${spacing.md}px`, backgroundColor: colors.surface.base, borderRadius: `${radius.md}px`, marginBottom: `${spacing.md}px`, textAlign: 'center' }}>
+              <div style={{ fontSize: 11, color: colors.text.muted, textTransform: 'uppercase', letterSpacing: 0.5 }}>Reclaimable</div>
+              <div style={{ fontSize: 24, fontWeight: 700, color: analyze.pct > 20 ? colors.error : colors.text.primary, marginTop: 4 }}>
+                ~{formatBytes(analyze.reclaimableBytes)} <span style={{ fontSize: 14, color: colors.text.muted }}>({analyze.pct}%)</span>
+              </div>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: `${spacing.sm}px`, marginBottom: `${spacing.md}px`, fontSize: 12, textAlign: 'center' }}>
+              <div><div style={{ color: colors.success, fontSize: 18, fontWeight: 600 }}>{analyze.groups.keep || 0}</div><div style={{ color: colors.text.muted }}>keep</div></div>
+              <div><div style={{ color: colors.error, fontSize: 18, fontWeight: 600 }}>{analyze.groups.wipe || 0}</div><div style={{ color: colors.text.muted }}>wipe</div></div>
+              <div><div style={{ color: colors.text.primary, fontSize: 18, fontWeight: 600 }}>{analyze.groups.request || 0}</div><div style={{ color: colors.text.muted }}>requests</div></div>
+            </div>
+            <div style={{ fontSize: 12, color: colors.text.muted, marginBottom: `${spacing.sm}px` }}>By prefix (live data)</div>
+            {Object.entries(analyze.byPrefix).sort((a, b) => b[1].bytes - a[1].bytes).map(([prefix, v]) => {
+              const totalLive = analyze.estLiveBytes || 1;
+              const pct = (100 * v.bytes / totalLive);
+              const barColor = v.cls === 'wipe' ? colors.error : v.cls === 'keep' ? colors.success : colors.text.muted;
+              return (
+                <div key={prefix} style={{ marginBottom: `${spacing.sm}px` }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13, color: colors.text.secondary }}>
+                    <span style={{ fontFamily: 'monospace' }}>{prefix} <span style={{ color: colors.text.muted }}>({v.count})</span></span>
+                    <span>{formatBytes(v.bytes)}</span>
+                  </div>
+                  <Bar pct={pct} color={barColor} bg={colors.border} />
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {modal === 'result' && result && (
+          <div>
+            <div style={{ padding: `${spacing.md}px`, backgroundColor: colors.surface.base, borderRadius: `${radius.md}px`, textAlign: 'center', marginBottom: `${spacing.md}px` }}>
+              <div style={{ fontSize: 11, color: colors.text.muted, textTransform: 'uppercase', letterSpacing: 0.5 }}>Freed</div>
+              <div style={{ fontSize: 28, fontWeight: 700, color: colors.success, marginTop: 4 }}>{formatBytes(result.freed)}</div>
+              <div style={{ fontSize: 13, color: colors.text.muted, marginTop: 4 }}>{formatBytes(result.before)} to {formatBytes(result.after)}</div>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: `${spacing.sm}px`, fontSize: 13, color: colors.text.secondary, textAlign: 'center' }}>
+              <div><div style={{ color: colors.success, fontSize: 18, fontWeight: 600 }}>{result.kept}</div><div>keys kept</div></div>
+              <div><div style={{ color: colors.error, fontSize: 18, fontWeight: 600 }}>{result.dropped}</div><div>keys dropped</div></div>
+            </div>
+          </div>
+        )}
+
+        <div style={{ marginTop: `${spacing.lg}px`, display: 'flex', justifyContent: 'center' }}>
+          <button onClick={onClose} style={{ padding: `${spacing.sm}px ${spacing.xl}px`, borderRadius: `${radius.md}px`, border: `1px solid ${colors.border}`, background: 'transparent', color: colors.text.primary, fontSize: 14, cursor: 'pointer', minWidth: 140 }}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ChipSelect({ options, selected, onChange, formatter, colors, spacing, radius }) {
+  return (
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: `${spacing.sm}px` }}>
+      {options.map((val) => {
+        const active = selected.includes(val);
+        return (
+          <button
+            key={val}
+            onClick={() => {
+              window.callBare('haptic:tap');
+              onChange(active ? selected.filter((v) => v !== val) : [...selected, val].sort((a, b) => a - b));
+            }}
+            style={{
+              padding: `${spacing.sm}px 14px`,
+              borderRadius: `${radius.full}px`,
+              border: `1px solid ${active ? colors.primary : colors.border}`,
+              backgroundColor: active ? colors.primary : 'transparent',
+              fontSize: '13px',
+              color: active ? '#FFFFFF' : colors.text.secondary,
+              cursor: 'pointer',
+            }}
+          >
+            {formatter ? formatter(val) : val}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// A labeled band of related sections. Seven equal-weight collapsibles in a flat
+// list read as a wall; grouping gives the page a shape you can skim past.
+function SettingsGroup({ title, children, colors, spacing }) {
+  return (
+    <section style={{ marginBottom: `${spacing.xl}px` }}>
+      <h3 style={{
+        fontSize: '11px',
+        fontWeight: 700,
+        letterSpacing: '0.09em',
+        textTransform: 'uppercase',
+        color: colors.text.muted,
+        margin: `0 0 ${spacing.sm}px`,
+        paddingLeft: `${spacing.sm}px`,
+      }}>
+        {title}
+      </h3>
+      {children}
+    </section>
+  );
+}
+
+// Inline "Saved." / error line for the auto-saving sections. Rendered under the
+// section that changed rather than once at the bottom of the page, so the feedback
+// is where the user is actually looking.
+function SaveStatus({ status, section, colors, spacing }) {
+  if (!status || status.section !== section) return null;
+  const isError = status.kind === 'error';
+  return (
+    <p
+      role={isError ? 'alert' : 'status'}
+      style={{
+        fontSize: '13px',
+        margin: `${spacing.sm}px 0 0`,
+        color: isError ? colors.error : colors.success,
+      }}
+    >
+      {status.message}
+    </p>
+  );
+}
+
+export default function Settings() {
+  const { colors, typography, spacing, radius, theme: currentTheme, setTheme } = useTheme();
+
+  // Collapsible state
+  const [pinOpen, setPinOpen] = useState(false);
+  const [timeOptsOpen, setTimeOptsOpen] = useState(false);
+  const [newAppsOpen, setNewAppsOpen] = useState(false);
+  const [warningOpen, setWarningOpen] = useState(false);
+  const [appearanceOpen, setAppearanceOpen] = useState(false);
+  // Screenshot scenes can pre-open a section; a collapsed section photographs as a
+  // title bar and tells you nothing about what is inside it.
+  const [connectionOpen, setConnectionOpen] = useState(() => (typeof window !== 'undefined' && window.__pearScreenshotOpenSection === 'connection'));
+  const [backupOpen, setBackupOpen] = useState(false);
+  const [backupMode, setBackupMode] = useState(null); // 'export' | 'import' | null
+  const [storageOpen, setStorageOpen] = useState(false);
+  const [storageBusy, setStorageBusy] = useState(false);
+  const [storageBreakdown, setStorageBreakdown] = useState(null);
+  const [storageAnalyze, setStorageAnalyze] = useState(null);
+  const [reclaimResult, setReclaimResult] = useState(null);
+  const [reclaimConfirm, setReclaimConfirm] = useState(false);
+  const [storageError, setStorageError] = useState(null);
+  const [storageModal, setStorageModal] = useState(null); // 'breakdown' | 'analyze' | 'result' | null
+
+  // Profile state
+  const [name, setName] = useState('');
+  const [savedName, setSavedName] = useState('');
+  const [avatar, setAvatar] = useState(null);
+  const [showPicker, setShowPicker] = useState(false);
+  const [savingName, setSavingName] = useState(false);
+  const [nameStatus, setNameStatus] = useState(null);
+  const [photoLoading, setPhotoLoading] = useState(false);
+
+  // PIN state
+  const [newPin, setNewPin] = useState('');
+  const [confirmPin, setConfirmPin] = useState('');
+  const [pinStatus, setPinStatus] = useState(null);
+  const [currentPin, setCurrentPin] = useState(null);
+  const [pinRevealed, setPinRevealed] = useState(false);
+  const confirmPinRef = useRef(null);
+
+  // Settings state
+  const [timeRequestMinutes, setTimeRequestMinutes] = useState(DEFAULT_TIME_OPTIONS);
+  const [warningMinutes, setWarningMinutes] = useState(DEFAULT_WARNING_THRESHOLDS);
+  // Off means a newly installed app on a child device waits for approval. On means
+  // it is allowed straight away and the parent just gets told about it.
+  const [autoApproveNewApps, setAutoApproveNewApps] = useState(false);
+  const [autoApproveStatus, setAutoApproveStatus] = useState(null);
+  // { section: 'time'|'warning', kind: 'saved'|'error', message } or null
+  const [settingsStatus, setSettingsStatus] = useState(null);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const saveTimer = useRef(null);
+  const statusTimer = useRef(null);
+  // settings:save replaces the whole parentSettings object, so every save sends
+  // all three values as they are when it goes out. Building the payload when the
+  // save was scheduled let a debounced chip save, firing after the auto-approve
+  // toggle, put the toggle back.
+  const currentSettings = useRef({ timeRequestMinutes: DEFAULT_TIME_OPTIONS, warningMinutes: DEFAULT_WARNING_THRESHOLDS, autoApproveNewApps: false });
+
+  // Connection / relay state. `relayStatus` is null until the worklet answers, and
+  // stays null on a worklet that has no relay at all.
+  const [relayEnabled, setRelayEnabled] = useState(true);
+  const [relayStatus, setRelayStatus] = useState(null);
+
+  useEffect(() => {
+    window.callBare('identity:getName')
+      .then(({ displayName, avatar: av }) => {
+        const n = displayName || '';
+        setName(n);
+        setSavedName(n);
+        if (av) setAvatar(av);
+      })
+      .catch(() => {});
+
+    window.callBare('settings:get')
+      .then((s) => {
+        if (s.timeRequestMinutes) setTimeRequestMinutes(s.timeRequestMinutes);
+        if (s.warningMinutes) setWarningMinutes(s.warningMinutes);
+        setAutoApproveNewApps(!!s.autoApproveNewApps);
+        currentSettings.current = {
+          timeRequestMinutes: s.timeRequestMinutes || DEFAULT_TIME_OPTIONS,
+          warningMinutes: s.warningMinutes || DEFAULT_WARNING_THRESHOLDS,
+          autoApproveNewApps: !!s.autoApproveNewApps,
+        };
+        setSettingsLoaded(true);
+      })
+      .catch(() => setSettingsLoaded(true));
+
+    window.callBare('pin:get')
+      .then(({ pin }) => { if (pin) setCurrentPin(pin); })
+      .catch(() => {});
+
+    window.callBare('relay:status')
+      .then((s) => {
+        if (!s) return;
+        setRelayStatus(s);
+        setRelayEnabled(s.enabled !== false);
+      })
+      .catch(() => {});
+  }, []);
+
+  // Refresh the relay counters while the section is open so an escalation happening
+  // right now is visible, rather than frozen at whatever it was when Settings mounted.
+  useEffect(() => {
+    if (!connectionOpen) return undefined;
+    const tick = () => window.callBare('relay:status').then((s) => { if (s) setRelayStatus(s); }).catch(() => {});
+    tick();
+    const id = setInterval(tick, 5000);
+    return () => clearInterval(id);
+  }, [connectionOpen]);
+
+  async function handleRelayToggle(checked) {
+    setRelayEnabled(checked);
+    try {
+      await window.callBare('pref:set', { key: 'relay:enabled', value: checked });
+    } catch {
+      setRelayEnabled(!checked); // put the switch back if the write failed
+    }
+  }
+
+  // Auto-hide revealed PIN when Override PIN section collapses.
+  useEffect(() => {
+    if (!pinOpen) setPinRevealed(false);
+  }, [pinOpen]);
+
+  // Leaving the tab with a debounced save still pending must not drop it - that is
+  // the exact failure the old Save Settings button had. Flush it on the way out,
+  // without touching state, since this component is going away.
+  useEffect(() => () => {
+    if (statusTimer.current) clearTimeout(statusTimer.current);
+    if (saveTimer.current) {
+      clearTimeout(saveTimer.current);
+      window.callBare('settings:save', { settings: currentSettings.current }).catch(() => {});
+    }
+  }, []);
+
+  async function handleNameSave() {
+    const trimmed = name.trim();
+    if (!trimmed || trimmed === savedName) return;
+    setSavingName(true);
+    setNameStatus(null);
+    try {
+      await window.callBare('identity:setName', { name: trimmed });
+      setSavedName(trimmed);
+      setNameStatus('success');
+      setTimeout(() => setNameStatus((s) => (s === 'success' ? null : s)), 2000);
+    } catch {
+      setNameStatus('error');
+    } finally {
+      setSavingName(false);
+    }
+  }
+
+  async function handleAvatarSave(newAvatar) {
+    setShowPicker(false);
+    try {
+      await window.callBare('identity:setAvatar', { avatar: newAvatar });
+      setAvatar(newAvatar);
+    } catch {
+      // silently fail
+    }
+  }
+
+  async function handlePickPhoto() {
+    setPhotoLoading(true);
+    try {
+      const av = await pickPhoto();
+      if (av) {
+        await window.callBare('identity:setAvatar', { avatar: av });
+        setAvatar(av);
+      }
+    } catch { /* cancelled or error */ }
+    setPhotoLoading(false);
+  }
+
+  async function handleRemovePhoto() {
+    setPhotoLoading(true);
+    try {
+      await window.callBare('identity:setAvatar', { avatar: null });
+      setAvatar(null);
+    } catch { /* error */ }
+    setPhotoLoading(false);
+  }
+
+  function handlePinSubmit(e) {
+    e.preventDefault();
+    const pinError = validatePin(newPin);
+    if (pinError) {
+      setPinStatus(pinError);
+      return;
+    }
+    if (newPin !== confirmPin) {
+      setPinStatus('PINs do not match.');
+      return;
+    }
+    setPinStatus(null);
+    window.callBare('pin:set', { pin: newPin })
+      .then(() => {
+        setPinStatus('success');
+        setNewPin('');
+        setConfirmPin('');
+        setCurrentPin(newPin);
+      })
+      .catch((err) => {
+        setPinStatus(err.message || 'Failed to set PIN. Please try again.');
+      });
+  }
+
+  // These two settings used to sit behind a "Save Settings" button at the foot of the
+  // page. That button looked global but persisted only these two of the seven
+  // sections, so a parent who changed a chip and never scrolled down silently lost
+  // it. They now save on change like everything else on this page.
+  //
+  // Debounced because settings:save is not cheap on the worklet side: it rewrites
+  // every child's policy and pushes it to each connected child. Picking four chips
+  // in a row should be one sync, not four.
+  function persistSettings(patch, section) {
+    setSettingsStatus(null);
+    currentSettings.current = { ...currentSettings.current, ...patch };
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(async () => {
+      saveTimer.current = null;
+      try {
+        await window.callBare('settings:save', { settings: currentSettings.current });
+        setSettingsStatus({ section, kind: 'saved', message: 'Saved and synced to your children.' });
+        if (statusTimer.current) clearTimeout(statusTimer.current);
+        statusTimer.current = setTimeout(
+          () => setSettingsStatus((s) => (s && s.kind === 'saved' ? null : s)),
+          2500,
+        );
+      } catch {
+        setSettingsStatus({ section, kind: 'error', message: 'Could not save. Your children still have the previous setting.' });
+      }
+    }, SAVE_DEBOUNCE_MS);
+  }
+
+  // Refusing the change outright, rather than accepting it and declining to persist,
+  // keeps what is on screen equal to what is stored. An empty list would leave the
+  // child with no options to pick from on the block overlay.
+  function handleTimeOptionsChange(v) {
+    if (v.length === 0) {
+      setSettingsStatus({ section: 'time', kind: 'error', message: 'Keep at least one option selected.' });
+      return;
+    }
+    setTimeRequestMinutes(v);
+    persistSettings({ timeRequestMinutes: v }, 'time');
+  }
+
+  function handleWarningChange(v) {
+    if (v.length === 0) {
+      setSettingsStatus({ section: 'warning', kind: 'error', message: 'Keep at least one option selected.' });
+      return;
+    }
+    setWarningMinutes(v);
+    persistSettings({ warningMinutes: v }, 'warning');
+  }
+
+  // Saves on tap, with no debounce: a switch reads as applied the moment it moves.
+  async function handleAutoApproveToggle(checked) {
+    const previous = currentSettings.current.autoApproveNewApps;
+    setAutoApproveNewApps(checked);
+    setAutoApproveStatus(null);
+    currentSettings.current = { ...currentSettings.current, autoApproveNewApps: checked };
+    try {
+      await window.callBare('settings:save', { settings: currentSettings.current });
+    } catch {
+      currentSettings.current = { ...currentSettings.current, autoApproveNewApps: previous };
+      setAutoApproveNewApps(previous);
+      setAutoApproveStatus('Failed to save. Try again.');
+    }
+  }
+
+
+  function formatBytes(n) {
+    if (!n || n < 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let u = 0;
+    let v = n;
+    while (v >= 1024 && u < units.length - 1) { v /= 1024; u++; }
+    return v.toFixed(v < 10 && u > 0 ? 1 : 0) + ' ' + units[u];
+  }
+
+  async function handleStorageBreakdown() {
+    setStorageError(null);
+    setStorageBusy(true);
+    try {
+      const res = await window.callBare('storage:breakdown');
+      setStorageBreakdown(res);
+      setStorageModal('breakdown');
+    } catch (e) {
+      setStorageError(e.message || 'Failed to read storage');
+    }
+    setStorageBusy(false);
+  }
+
+  async function handleStorageAnalyze() {
+    setStorageError(null);
+    setStorageBusy(true);
+    try {
+      const res = await window.callBare('storage:analyze');
+      setStorageAnalyze(res);
+      setStorageModal('analyze');
+    } catch (e) {
+      setStorageError(e.message || 'Failed to analyze storage');
+    }
+    setStorageBusy(false);
+  }
+
+  async function handleStorageReclaim() {
+    setStorageError(null);
+    setStorageBusy(true);
+    setReclaimConfirm(false);
+    try {
+      const res = await window.callBare('storage:rebuild');
+      setReclaimResult(res);
+      try { setStorageBreakdown(await window.callBare('storage:breakdown')); } catch {}
+      try { setStorageAnalyze(await window.callBare('storage:analyze')); } catch {}
+      setStorageModal('result');
+    } catch (e) {
+      setStorageError(e.message || 'Reclaim failed');
+    }
+    setStorageBusy(false);
+  }
+
+  const inputStyle = {
+    padding: '10px',
+    border: `1px solid ${colors.border}`,
+    borderRadius: `${radius.md}px`,
+    fontSize: '15px',
+    marginTop: `${spacing.xs}px`,
+    backgroundColor: colors.surface.input,
+    color: colors.text.primary,
+    width: '100%',
+    boxSizing: 'border-box',
+  };
+
+  const collapsibleProps = { colors, spacing, radius };
+
+  return (
+    <div style={{ padding: `${spacing.base}px`, overflowY: 'auto', flex: 1 }}>
+      <h2 style={{ ...typography.heading, color: colors.text.primary, marginBottom: `${spacing.lg}px`, textAlign: 'center' }}>Settings</h2>
+
+      {/* ── Your profile ───────────────────────────────────────────────────── */}
+      <SettingsGroup title="Your profile" colors={colors} spacing={spacing}>
+
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', marginBottom: `${spacing.lg}px` }}>
+          <Avatar avatar={avatar} name={savedName} size={80} onClick={() => setShowPicker(true)} />
+          <div style={{ display: 'flex', gap: '8px', marginTop: `${spacing.sm}px` }}>
+            <button
+              onClick={() => { window.callBare('haptic:tap'); handlePickPhoto(); }}
+              disabled={photoLoading}
+              style={{ fontSize: '12px', padding: '5px 14px', borderRadius: `${radius.md}px`, border: `1px solid ${colors.border}`, background: 'transparent', color: colors.text.primary, cursor: photoLoading ? 'wait' : 'pointer', display: 'flex', alignItems: 'center', gap: '5px', opacity: photoLoading ? 0.5 : 1 }}
+            >
+              <Icon name="ImageSquare" size={14} color={colors.text.primary} /> Photo
+            </button>
+            {avatar && avatar.type === 'custom' && (
+              <button
+                onClick={() => { window.callBare('haptic:tap'); handleRemovePhoto(); }}
+                disabled={photoLoading}
+                style={{ fontSize: '12px', padding: '5px 14px', borderRadius: `${radius.md}px`, border: '1px solid #D45F7A', background: 'transparent', color: '#D45F7A', cursor: photoLoading ? 'wait' : 'pointer', opacity: photoLoading ? 0.5 : 1 }}
+              >
+                Remove
+              </button>
+            )}
+          </div>
+        </div>
+
+        {showPicker && (
+          <AvatarPicker
+            currentAvatar={avatar}
+            name={savedName}
+            onSave={handleAvatarSave}
+            onCancel={() => setShowPicker(false)}
+          />
+        )}
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: `${spacing.sm}px` }}>
+          <label style={{ display: 'flex', flexDirection: 'column', gap: `${spacing.xs}px`, fontSize: '14px', color: colors.text.secondary }}>
+            Parent Name
+            <input
+              type="text"
+              value={name}
+              onChange={(e) => { setName(e.target.value); setNameStatus(null); }}
+              onBlur={handleNameSave}
+              placeholder="e.g. Mom"
+              style={inputStyle}
+            />
+          </label>
+          {savingName && <p style={{ color: colors.text.muted, fontSize: '13px', margin: 0 }}>Saving...</p>}
+          {!savingName && nameStatus === 'success' && <p style={{ color: colors.success, fontSize: '13px', margin: 0 }}>Saved.</p>}
+          {nameStatus === 'error' && <p style={{ color: colors.error, fontSize: '13px', margin: 0 }}>Failed to save name.</p>}
+        </div>
+      </SettingsGroup>
+
+      {/* ── What your children experience ──────────────────────────────────── */}
+      <SettingsGroup title="What your children see" colors={colors} spacing={spacing}>
+
+      {settingsLoaded && (
+        <Collapsible title="Time Request Options" icon="Clock" open={timeOptsOpen} onToggle={() => setTimeOptsOpen(o => !o)} maxHeight="260px" {...collapsibleProps}>
+          <p style={{ fontSize: '12px', color: colors.text.muted, marginBottom: `${spacing.md}px`, marginTop: 0 }}>
+            Choose which duration options the child sees when requesting more time from the block overlay.
+          </p>
+          <ChipSelect
+            options={AVAILABLE_TIME_OPTIONS}
+            selected={timeRequestMinutes}
+            onChange={handleTimeOptionsChange}
+            formatter={formatMinutes}
+            colors={colors}
+            spacing={spacing}
+            radius={radius}
+          />
+          <SaveStatus status={settingsStatus} section="time" colors={colors} spacing={spacing} />
+        </Collapsible>
+      )}
+
+      {settingsLoaded && (
+        <Collapsible title="Warning Notifications" icon="Bell" open={warningOpen} onToggle={() => setWarningOpen(o => !o)} maxHeight="260px" {...collapsibleProps}>
+          <p style={{ fontSize: '12px', color: colors.text.muted, marginBottom: `${spacing.md}px`, marginTop: 0 }}>
+            The child will be notified this many minutes before a schedule block starts or a daily time limit runs out.
+          </p>
+          <ChipSelect
+            options={AVAILABLE_WARNING_OPTIONS}
+            selected={warningMinutes}
+            onChange={handleWarningChange}
+            formatter={(v) => v + ' min'}
+            colors={colors}
+            spacing={spacing}
+            radius={radius}
+          />
+          <SaveStatus status={settingsStatus} section="warning" colors={colors} spacing={spacing} />
+        </Collapsible>
+      )}
+
+      {/* New App Installs */}
+      {settingsLoaded && (
+        <Collapsible title="New App Installs" icon="DownloadSimple" open={newAppsOpen} onToggle={() => setNewAppsOpen(o => !o)} maxHeight="220px" {...collapsibleProps}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: `${spacing.md}px` }}>
+            <span style={{ ...typography.body, color: colors.text.primary }}>Allow new apps automatically</span>
+            <Toggle checked={autoApproveNewApps} onChange={handleAutoApproveToggle} ariaLabel="Allow new apps automatically" />
+          </div>
+          <p style={{ fontSize: '12px', color: colors.text.muted, marginTop: `${spacing.sm}px`, marginBottom: 0 }}>
+            {autoApproveNewApps
+              ? 'Apps your child installs are allowed right away. You still get a notification and can block them from the Apps tab.'
+              : 'Apps your child installs are blocked until you approve them from the Activity tab.'}
+          </p>
+          {autoApproveStatus && (
+            <p role="alert" style={{ fontSize: '13px', color: colors.error, marginTop: `${spacing.sm}px`, marginBottom: 0 }}>{autoApproveStatus}</p>
+          )}
+        </Collapsible>
+      )}
+
+      <div data-tour-id="settings-override-pin">
+      <Collapsible title="Override PIN" icon="LockSimple" open={pinOpen} onToggle={() => setPinOpen(o => !o)} maxHeight="350px" {...collapsibleProps}>
+        <p style={{ fontSize: '12px', color: colors.text.muted, marginBottom: `${spacing.md}px`, marginTop: 0 }}>
+          Children enter this PIN on the block overlay to get temporary access. The PIN is hashed before leaving this device.
+        </p>
+        {currentPin && (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: `${spacing.sm}px`, padding: `${spacing.sm}px ${spacing.md}px`, backgroundColor: colors.surface.base, borderRadius: `${radius.md}px`, marginBottom: `${spacing.md}px` }}>
+            <span style={{ fontSize: '14px', color: colors.text.secondary }}>
+              Current PIN: <span style={{ fontFamily: 'monospace', fontSize: '16px', color: colors.text.primary, letterSpacing: '2px' }}>{pinRevealed ? currentPin : '••••'}</span>
+            </span>
+            <button
+              type="button"
+              onClick={() => { window.callBare('haptic:tap'); setPinRevealed(v => !v); }}
+              style={{ display: 'flex', alignItems: 'center', gap: `${spacing.xs}px`, background: 'none', border: 'none', padding: `${spacing.xs}px`, cursor: 'pointer', color: colors.text.muted, fontSize: '13px' }}
+              aria-label={pinRevealed ? 'Hide current PIN' : 'Show current PIN'}
+            >
+              <Icon name={pinRevealed ? 'EyeSlash' : 'Eye'} size={18} color={colors.text.muted} />
+              {pinRevealed ? 'Hide' : 'Show'}
+            </button>
+          </div>
+        )}
+        <form onSubmit={handlePinSubmit} style={{ display: 'flex', flexDirection: 'column', gap: `${spacing.md}px` }} aria-label="Change PIN form">
+          <label style={{ display: 'flex', flexDirection: 'column', gap: `${spacing.xs}px`, fontSize: '14px', color: colors.text.secondary }}>
+            New PIN (4 to {MAX_PIN_LENGTH} digits)
+            <input
+              type="text"
+              value={newPin}
+              onChange={(e) => {
+                setNewPin(e.target.value);
+                setPinStatus(null);
+              }}
+              placeholder="e.g. 1234"
+              style={inputStyle}
+              aria-label="New PIN"
+              inputMode="numeric"
+              maxLength={MAX_PIN_LENGTH}
+            />
+          </label>
+          <label style={{ display: 'flex', flexDirection: 'column', gap: `${spacing.xs}px`, fontSize: '14px', color: colors.text.secondary }}>
+            Confirm PIN
+            <input
+              ref={confirmPinRef}
+              type="text"
+              value={confirmPin}
+              onChange={(e) => { setConfirmPin(e.target.value); setPinStatus(null); }}
+              placeholder="Repeat PIN"
+              style={inputStyle}
+              aria-label="Confirm PIN"
+              inputMode="numeric"
+              maxLength={MAX_PIN_LENGTH}
+            />
+          </label>
+          {pinStatus && pinStatus !== 'success' && (
+            <p style={{ color: colors.error, fontSize: '13px', margin: 0 }} role="alert">{pinStatus}</p>
+          )}
+          {pinStatus === 'success' && (
+            <p style={{ color: colors.success, fontSize: '13px', margin: 0 }} role="status">PIN updated successfully.</p>
+          )}
+          <Button type="submit" style={{ alignSelf: 'center' }} aria-label="Save PIN">
+            Save PIN
+          </Button>
+        </form>
+      </Collapsible>
+      </div>
+
+      </SettingsGroup>
+
+      {/* ── This device ────────────────────────────────────────────────────── */}
+      <SettingsGroup title="This device" colors={colors} spacing={spacing}>
+
+      {settingsLoaded && (
+        <Collapsible title="Appearance" icon="SunDim" open={appearanceOpen} onToggle={() => setAppearanceOpen(o => !o)} maxHeight="200px" {...collapsibleProps}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: `${spacing.sm}px` }}>
+              <Icon name={currentTheme === 'dark' ? 'Moon' : 'SunDim'} size={20} color={colors.text.primary} />
+              <span style={{ fontSize: '14px', color: colors.text.primary }}>{currentTheme === 'dark' ? 'Dark mode' : 'Light mode'}</span>
+            </div>
+            <Toggle checked={currentTheme === 'dark'} onChange={(checked) => setTheme(checked ? 'dark' : 'light')} />
+          </div>
+        </Collapsible>
+      )}
+
+      {settingsLoaded && relayStatus && (
+        <Collapsible title="Connection" icon="ShareNetwork" open={connectionOpen} onToggle={() => setConnectionOpen(o => !o)} maxHeight="620px" {...collapsibleProps}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: `${spacing.md}px` }}>
+            <span style={{ fontSize: '14px', color: colors.text.primary }}>Use the PearGuard relay when a direct connection fails</span>
+            <Toggle checked={relayEnabled} onChange={handleRelayToggle} ariaLabel="Use the relay when a direct connection fails" />
+          </div>
+          <p style={{ fontSize: '12px', color: colors.text.muted, marginTop: `${spacing.sm}px`, marginBottom: 0 }}>
+            Your devices always try to connect to each other directly first. On some mobile and home networks a
+            direct connection is impossible, and without a helper the parent device simply cannot reach the child.
+            When that happens PearGuard passes the connection through a relay we run.
+          </p>
+          <p style={{ fontSize: '12px', color: colors.text.muted, marginTop: `${spacing.sm}px`, marginBottom: 0 }}>
+            The relay cannot read anything it carries - everything stays encrypted between your two devices. It does
+            see that two devices are talking and how much data they send. Turn this off to stay strictly device-to-device,
+            knowing some networks will then never connect.
+          </p>
+          {relayStatus.relaying && (
+            <div style={{ marginTop: `${spacing.md}px`, fontSize: '12px', color: colors.text.secondary }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span>Times a direct connection failed and the relay was tried</span>
+                <span style={{ color: colors.text.primary }}>{relayStatus.relaying.attempts}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
+                <span>Of those, connected through the relay</span>
+                <span style={{ color: colors.text.primary }}>{relayStatus.relaying.successes}</span>
+              </div>
+              {relayStatus.relaying.attempts === 0 && (
+                <p style={{ marginTop: `${spacing.sm}px`, marginBottom: 0, color: colors.text.muted }}>
+                  Zero is the good number here - it means your devices have always managed to connect directly.
+                </p>
+              )}
+            </div>
+          )}
+          {relayStatus.randomized && (
+            <p style={{ fontSize: '12px', color: colors.text.muted, marginTop: `${spacing.sm}px`, marginBottom: 0 }}>
+              This device is on a network that blocks direct connections entirely, so it uses the relay every time.
+            </p>
+          )}
+        </Collapsible>
+      )}
+
+      </SettingsGroup>
+
+      {/* ── Data ───────────────────────────────────────────────────────────── */}
+      <SettingsGroup title="Data" colors={colors} spacing={spacing}>
+
+      {settingsLoaded && (
+        <Collapsible title="Device Backup" icon="Export" open={backupOpen} onToggle={() => setBackupOpen(o => !o)} maxHeight="220px" {...collapsibleProps}>
+          <div style={{ fontSize: '13px', color: colors.text.muted, marginBottom: `${spacing.sm}px` }}>
+            Save your full parent state (identity, children, policies) to migrate to a new device. To restore a backup, install the app on a fresh device and choose "Restore parent from backup" on the welcome screen.
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'center' }}>
+            <Button variant="secondary" icon="Export" onClick={() => { window.callBare('haptic:tap'); setBackupMode('export'); }}>Export backup</Button>
+          </div>
+        </Collapsible>
+      )}
+
+      <Collapsible title="Storage" icon="Trash" open={storageOpen} onToggle={() => setStorageOpen(o => !o)} maxHeight="400px" {...collapsibleProps}>
+        <p style={{ fontSize: '12px', color: colors.text.muted, marginBottom: `${spacing.md}px`, marginTop: 0 }}>
+          The local database grows over time as telemetry (usage reports, alerts, sessions) accumulates. Check the current footprint and reclaim disk when it gets large.
+        </p>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: `${spacing.sm}px`, alignItems: 'center' }}>
+          <Button variant="secondary" onClick={() => { window.callBare('haptic:tap'); handleStorageBreakdown(); }} disabled={storageBusy} style={{ minWidth: '200px' }}>Storage Breakdown</Button>
+          <Button variant="secondary" onClick={() => { window.callBare('haptic:tap'); handleStorageAnalyze(); }} disabled={storageBusy} style={{ minWidth: '200px' }}>Analyze Reclaimable</Button>
+          <Button onClick={() => { window.callBare('haptic:tap'); setReclaimConfirm(true); }} disabled={storageBusy || !storageAnalyze} style={{ minWidth: '200px' }}>Reclaim Storage</Button>
+        </div>
+        {storageBusy && <p style={{ fontSize: '13px', color: colors.text.muted, margin: `${spacing.md}px 0 0`, textAlign: 'center' }}>Working...</p>}
+        {storageError && <p style={{ fontSize: '13px', color: colors.error, margin: `${spacing.md}px 0 0`, textAlign: 'center' }}>{storageError}</p>}
+      </Collapsible>
+
+      </SettingsGroup>
+
+      {/* Modals live outside the groups: they render nothing until opened. */}
+      <DeviceBackupModal
+        visible={backupMode !== null}
+        mode={backupMode || 'export'}
+        onClose={() => setBackupMode(null)}
+      />
+
+      <StorageModal
+        modal={storageModal}
+        onClose={() => setStorageModal(null)}
+        breakdown={storageBreakdown}
+        analyze={storageAnalyze}
+        result={reclaimResult}
+        colors={colors}
+        typography={typography}
+        spacing={spacing}
+        radius={radius}
+        formatBytes={formatBytes}
+      />
+
+      {reclaimConfirm && (
+        <div onClick={() => setReclaimConfirm(false)} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: `${spacing.lg}px` }}>
+          <div onClick={(e) => e.stopPropagation()} style={{ backgroundColor: colors.surface.card, borderRadius: `${radius.lg}px`, padding: `${spacing.lg}px`, maxWidth: 420, width: '100%', border: `1px solid ${colors.border}` }}>
+            <h3 style={{ ...typography.subheading, color: colors.text.primary, margin: 0, marginBottom: `${spacing.md}px`, textAlign: 'center' }}>Reclaim Storage?</h3>
+            <p style={{ fontSize: '13px', color: colors.text.secondary, margin: 0, marginBottom: `${spacing.lg}px`, lineHeight: 1.5, textAlign: 'center' }}>
+              This permanently deletes historical usage reports, alerts, override grants, bypass events and session logs. Identity, children, policies and pending requests are preserved.
+            </p>
+            <div style={{ display: 'flex', gap: `${spacing.sm}px`, justifyContent: 'center' }}>
+              <Button variant="secondary" onClick={() => setReclaimConfirm(false)} style={{ flex: 1, maxWidth: 160 }}>Cancel</Button>
+              <Button onClick={() => { window.callBare('haptic:tap'); handleStorageReclaim(); }} style={{ flex: 1, maxWidth: 160 }}>Reclaim now</Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* No global save button: every section on this page persists on change. */}
+      <div style={{ height: `${spacing.xxl}px` }} />
+    </div>
+  );
+}

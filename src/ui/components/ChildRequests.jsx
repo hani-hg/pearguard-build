@@ -1,0 +1,127 @@
+import React, { useState, useEffect } from 'react'
+import { useTheme } from '../theme.js'
+
+function statusBadge(status, colors) {
+  switch (status) {
+    case 'approved': return { label: 'Approved!', color: colors.success }
+    case 'denied':   return { label: 'Denied',    color: colors.error }
+    // Nobody answered inside the window. Saying so beats a "Pending..." that
+    // would sit there forever, and the child can ask again now.
+    case 'expired':  return { label: 'No answer',  color: colors.text.muted }
+    default:         return { label: 'Pending...', color: colors.text.muted }
+  }
+}
+
+// `embedded` drops the page heading and padding, for use inside the Home tab's
+// requests sheet, which is where the decision notification lands.
+export default function ChildRequests({ embedded = false } = {}) {
+  const { colors, typography, spacing, radius } = useTheme()
+  const [requests, setRequests] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [clearing, setClearing] = useState(false)
+
+  async function loadRequests() {
+    setLoading(true)
+    const { requests } = await window.callBare('requests:list')
+    // Newest first, so the answer a notification just announced is on top.
+    setRequests((requests || []).slice().sort((a, b) => (b.requestedAt || 0) - (a.requestedAt || 0)))
+    setLoading(false)
+  }
+
+  async function handleClearResolved() {
+    setClearing(true)
+    await window.callBare('requests:clear')
+    await loadRequests()
+    setClearing(false)
+  }
+
+  useEffect(() => {
+    let isMounted = true
+    loadRequests().then(() => { if (!isMounted) return })
+    const unsubSubmit = window.onBareEvent('request:submitted', () => { if (isMounted) loadRequests() })
+    const unsubUpdated = window.onBareEvent('request:updated', () => { if (isMounted) loadRequests() })
+    return () => {
+      isMounted = false
+      unsubSubmit()
+      unsubUpdated()
+    }
+  }, [])
+
+  if (loading) {
+    return (
+      <div style={{ padding: `${spacing.xl}px`, color: colors.text.muted, ...typography.body }}>
+        Loading...
+      </div>
+    )
+  }
+
+  const hasResolved = requests.some((r) => r.status === 'approved' || r.status === 'denied' || r.status === 'expired')
+
+  return (
+    <div style={{ padding: embedded ? 0 : `${spacing.xl}px`, ...typography.body, color: colors.text.primary }}>
+      <div style={{
+        marginBottom: `${spacing.base}px`,
+        display: 'flex', alignItems: 'center', justifyContent: embedded ? 'center' : 'space-between',
+      }}>
+        {!embedded && <h2 style={{ ...typography.display, color: colors.text.primary, margin: 0 }}>My Requests</h2>}
+        {hasResolved && (
+          <button
+            onClick={() => { window.callBare('haptic:tap'); handleClearResolved(); }}
+            disabled={clearing}
+            style={{
+              ...typography.caption,
+              padding: `${spacing.xs}px ${spacing.md}px`,
+              border: `1px solid ${colors.border}`,
+              borderRadius: `${radius.md}px`,
+              background: colors.surface.card,
+              color: colors.text.secondary,
+              cursor: clearing ? 'not-allowed' : 'pointer',
+            }}
+          >
+            {clearing ? 'Clearing...' : 'Clear resolved'}
+          </button>
+        )}
+      </div>
+
+      {requests.length === 0 && (
+        <p style={{ ...typography.body, color: colors.text.muted, ...(embedded && { textAlign: 'center' }) }}>No requests yet.</p>
+      )}
+
+      {requests.map((req) => {
+        const badge = statusBadge(req.status, colors)
+        return (
+          <div
+            key={req.id}
+            style={{
+              padding: `${spacing.base}px`,
+              marginBottom: `${spacing.md}px`,
+              borderRadius: `${radius.md}px`,
+              backgroundColor: colors.surface.card,
+              border: `1px solid ${colors.border}`,
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+            }}
+          >
+            <div>
+              <div style={{ ...typography.body, fontWeight: '600', color: colors.text.primary }}>
+                {req.packageName === 'general' ? 'More screen time' : (req.appName || req.packageName)}
+              </div>
+              <div style={{ ...typography.caption, color: colors.text.muted, marginTop: `${spacing.xs}px` }}>
+                {new Date(req.requestedAt).toLocaleTimeString()}
+              </div>
+              {req.status === 'denied' && req.denyNote && (
+                <div style={{ ...typography.caption, color: colors.text.secondary, marginTop: `${spacing.xs}px`, fontStyle: 'italic' }}>
+                  "{req.denyNote}"
+                </div>
+              )}
+            </div>
+            <div style={{ ...typography.caption, fontWeight: '700', color: badge.color }}>
+              {badge.label}
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
